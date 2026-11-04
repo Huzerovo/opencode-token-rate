@@ -1,9 +1,22 @@
 import { Plugin } from "@opencode/plugin/tui"
-import { autoBucketMinutes, buildRecord, type ModelRef } from "./rate.ts"
+import {
+  autoBucketMinutes,
+  buildRecord,
+  formatTokens,
+  RATE_WINDOWS,
+  type ModelRef,
+  type ModelUsage,
+  type RateAverages,
+} from "./rate.ts"
 import { TokenRateRpc } from "./rpc.ts"
 
+const BAR_FILLED = "━".repeat(200)
+const BAR_EMPTY = "─".repeat(200)
+const RULE = "─".repeat(200)
+
 interface LiveState {
-  bySession: Record<string, { rate: number; average: number }>
+  bySession: Record<string, number>
+  averages?: RateAverages
   usage: UsageView | null
 }
 
@@ -39,8 +52,8 @@ export default Plugin.define({
       initial: { bySession: {}, usage: null },
     })
     const pending = new Map<string, PendingStep>()
-    const samples = new Map<string, Array<{ at: number; output: number; generation: number }>>()
     let usageSequence = 0
+    let averagesSequence = 0
 
     const stopStarted = context.data.on("session.step.started", (event) => {
       pending.set(`${event.data.sessionID}:${event.data.assistantMessageID}`, {
@@ -82,7 +95,21 @@ export default Plugin.define({
       }
     }
 
+    const refreshAverages = async () => {
+      const sequence = ++averagesSequence
+      try {
+        const result = (await context.client.rpc(TokenRateRpc).averages({})) as RateAverages
+        if (sequence !== averagesSequence) return
+        updateLive((draft) => {
+          draft.averages = result
+        })
+      } catch {
+        // Keep the last known rates; /token-rate surfaces errors when the user asks for them.
+      }
+    }
+
     void refreshUsage()
+    void refreshAverages()
 
     const stopEnded = context.data.on("session.step.ended", (event) => {
       const { sessionID, assistantMessageID } = event.data
@@ -104,31 +131,69 @@ export default Plugin.define({
         finish: event.data.finish,
       })
 
-      const recent = (samples.get(sessionID) ?? []).filter((sample) => sample.at >= record.at - 60_000)
-      recent.push({
-        at: record.at,
-        output: record.tokens.output,
-        generation: record.duration.generation,
-      })
-      samples.set(sessionID, recent)
-
-      const output = recent.reduce((sum, sample) => sum + sample.output, 0)
-      const generation = recent.reduce((sum, sample) => sum + sample.generation, 0)
-      const average = generation > 0 ? (output * 1000) / generation : record.rate.output
-
       updateLive((draft) => {
-        draft.bySession[sessionID] = { rate: record.rate.output, average }
+        draft.bySession[sessionID] = record.rate.output
       })
       void refreshUsage()
+      void refreshAverages()
     })
+
+    const section = (title: string, tone: "faint" | "muted") => (
+      <box flexDirection="row">
+        <text fg={context.theme.text[tone]}>{`${title} `}</text>
+        <box flexGrow={1} flexBasis={0} minWidth={0}>
+          <text wrapMode="none" fg={context.theme.border.base}>{RULE}</text>
+        </box>
+      </box>
+    )
+
+    const UsageRow = (props: { label: string; meter: UsageMeterView }) => {
+      const parts = usageParts(props.meter.percent)
+      const stage = props.meter.limited ? "error" : parts.stage
+      const filled = Math.max(parts.percent, 0.01)
+      const empty = Math.max(100 - parts.percent, 0.01)
+      const right = parts.percent >= 100 ? "LIMIT" : `${parts.percent.toFixed(1)}%`
+      return (
+        <box flexDirection="row">
+          <text width={9} fg={context.theme.text.base}>{props.label}</text>
+          <box flexGrow={1} flexDirection="row">
+            <box flexGrow={filled} flexBasis={0} minWidth={parts.percent > 0 ? 1 : 0}>
+              <text wrapMode="none" fg={context.theme.text.feedback[stage].base}>{BAR_FILLED}</text>
+            </box>
+            <box flexGrow={empty} flexBasis={0} minWidth={0}>
+              <text wrapMode="none" fg={context.theme.text.faint}>{BAR_EMPTY}</text>
+            </box>
+          </box>
+          <text width={7} textAlign="right" fg={context.theme.text.base}>{right}</text>
+        </box>
+      )
+    }
+
+    const rateRow = (label: string, value: number | undefined) => (
+      <box flexDirection="row" justifyContent="space-between">
+        <text fg={context.theme.text.base}>{label}</text>
+        <text fg={context.theme.text.base}>{value === undefined ? "—" : `${value.toFixed(1)} tok/s`}</text>
+      </box>
+    )
+
+    const modelRow = (usage: ModelUsage) => {
+      const name = usage.model.length > 19 ? `${usage.model.slice(0, 18)}…` : usage.model
+      return (
+        <box flexDirection="row" justifyContent="space-between">
+          <text fg={context.theme.text.base}>{name}</text>
+          <text fg={context.theme.text.base}>{formatTokens(usage.tokens)}</text>
+        </box>
+      )
+    }
 
     const removeSlot = context.ui.slot({
       append: "prompt.footer.status",
       render: ({ sessionID }) => {
         const value = sessionID ? live.bySession[sessionID] : undefined
-        return value
-          ? <text fg={context.theme.text.base}>{`${value.rate.toFixed(1)} tok/s · 1m ${value.average.toFixed(1)}`}</text>
-          : null
+        const stats = sessionID ? live.averages?.sessions[sessionID] : undefined
+        return value === undefined
+          ? null
+          : <text fg={context.theme.text.base}>{`${value.toFixed(1)} tok/s · 30c ${fixed(stats?.recent30)} · ses ${fixed(stats?.session)}`}</text>
       },
     })
 
@@ -136,23 +201,38 @@ export default Plugin.define({
       append: "sidebar.content",
       render: ({ sessionID }) => {
         const value = sessionID ? live.bySession[sessionID] : undefined
+        const stats = sessionID ? live.averages?.sessions[sessionID] : undefined
         const usage = live.usage
-        if (!value && !usage) return null
+        if (value === undefined && !stats && !usage) return null
 
         return (
-          <box flexDirection="column" border borderStyle="single" borderColor={context.theme.border.base} paddingX={1}>
-            {value ? (
+          <box flexDirection="column" border borderStyle="single" borderColor={context.theme.text.faint} paddingX={1}>
+            {value !== undefined || stats ? (
               <>
                 <text fg={context.theme.text.muted}>Token rate</text>
-                <text fg={context.theme.text.base}>{`${value.rate.toFixed(1)} tok/s · 1m ${value.average.toFixed(1)}`}</text>
+                {section("By calls", "faint")}
+                {rateRow("now", value)}
+                {rateRow("30c", stats?.recent30)}
+                {rateRow("session", stats?.session)}
+                {section("By active time", "faint")}
+                {RATE_WINDOWS.map(({ key }) => rateRow(key, stats?.windows[key]))}
+              </>
+            ) : null}
+            {stats && stats.models.length > 0 ? (
+              <>
+                {section("Models", "muted")}
+                {stats.models.slice(0, 5).map((model) => modelRow(model))}
+                {stats.models.length > 5 ? (
+                  <text fg={context.theme.text.faint}>{`+${stats.models.length - 5} more`}</text>
+                ) : null}
               </>
             ) : null}
             {usage ? (
               <>
-                <text fg={context.theme.text.muted}>Go usage</text>
-                <text fg={context.theme.text.base}>{usageLine("rolling", usage.rolling)}</text>
-                <text fg={context.theme.text.base}>{usageLine("weekly", usage.weekly)}</text>
-                <text fg={context.theme.text.base}>{usageLine("monthly", usage.monthly)}</text>
+                {section("Go usage", "muted")}
+                <UsageRow label="rolling" meter={usage.rolling} />
+                <UsageRow label="weekly" meter={usage.weekly} />
+                <UsageRow label="monthly" meter={usage.monthly} />
               </>
             ) : null}
           </box>
@@ -275,14 +355,19 @@ function parseSpan(input: string | undefined): { hours: number } | { error: stri
   return { hours: unit === "m" ? amount / 60 : unit === "h" ? amount : amount * 24 }
 }
 
-function usageLine(label: string, meter: UsageMeterView): string {
-  return `${label.padEnd(8)} ${progressBar(meter.percent)} ${meter.percent.toFixed(1).padStart(5)}%${meter.limited ? " LIMITED" : ""}`
+function fixed(value: number | undefined): string {
+  return value === undefined ? "—" : value.toFixed(1)
 }
 
-function progressBar(percent: number): string {
+function usageParts(percent: number): {
+  percent: number
+  stage: "success" | "warning" | "error"
+} {
   const value = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : 0
-  const filled = Math.ceil(value / 10)
-  return `${"█".repeat(filled)}${"░".repeat(10 - filled)}`
+  return {
+    percent: value,
+    stage: value >= 90 ? "error" : value >= 70 ? "warning" : "success",
+  }
 }
 
 function meterLine(label: string, meter: Meter): string {

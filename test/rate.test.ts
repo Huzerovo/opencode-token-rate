@@ -3,6 +3,7 @@ import test from "node:test"
 import {
   aggregate,
   autoBucketMinutes,
+  averageRates,
   buildRecord,
   formatSummary,
   type RateRecord,
@@ -21,15 +22,17 @@ function makeRecord(
   output: number,
   generation: number,
   total: number,
+  sessionID = "ses_test",
+  model: RateRecord["model"] = { providerID: "opencode", id: "test" },
 ): RateRecord {
   return buildRecord({
     endedAt,
     startedAt: endedAt - total,
     streamedAt: endedAt - (total - generation),
-    sessionID: "ses_test",
+    sessionID,
     messageID: `msg_${endedAt}`,
     agent: "build",
-    model: { providerID: "opencode", id: "test" },
+    model,
     tokens: usage(output),
     finish: "stop",
   })
@@ -101,4 +104,41 @@ test("autoBucketMinutes keeps the table near 24 rows", () => {
   assert.equal(autoBucketMinutes(0.5), 5)
   assert.equal(autoBucketMinutes(24), 60)
   assert.equal(autoBucketMinutes(24 * 7), 720)
+})
+
+test("averageRates uses session active time for each window and splits models", () => {
+  const base = Date.UTC(2026, 0, 2)
+  const records = Array.from({ length: 10 }, (_, i) =>
+    makeRecord(base + i * 60_000, i + 1, 10_000, 20_000, "ses_a"),
+  )
+  records.push(
+    makeRecord(base + 30_000, 100, 2_000, 4_000, "ses_b", { providerID: "opencode", id: "other" }),
+  )
+
+  const averages = averageRates(records)
+  const a = averages.sessions.ses_a
+  assert.equal(a.session, 0.55)
+  assert.equal(a.recent30, 0.55)
+  assert.equal(a.windows["1m"], 0.75)
+  assert.equal(a.windows["10m"], 0.55)
+  assert.equal(a.windows["30m"], 0.55)
+  assert.equal(a.windows["1h"], 0.55)
+  assert.equal(a.windows["1d"], 0.55)
+  assert.deepEqual(a.models, [{ model: "test", tokens: 30_055, steps: 10 }])
+  assert.equal(averages.sessions.ses_b.session, 50)
+  assert.deepEqual(averages.sessions.ses_b.models, [{ model: "other", tokens: 3_100, steps: 1 }])
+})
+
+test("averageRates caps the recent average at 30 calls", () => {
+  const base = Date.UTC(2026, 0, 2)
+  const records = [makeRecord(base, 10_000, 1_000, 2_000, "ses_a")]
+  for (let i = 1; i <= 31; i++) {
+    records.push(makeRecord(base + i * 1_000, 10, 1_000, 2_000, "ses_a"))
+  }
+
+  const a = averageRates(records).sessions.ses_a
+  assert.equal(a.recent30, 10)
+  assert.equal(a.session, 322.1875)
+
+  assert.deepEqual(averageRates([]), { sessions: {} })
 })

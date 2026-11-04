@@ -3,7 +3,13 @@ import os from "node:os"
 import path from "node:path"
 import { Plugin } from "@opencode/plugin"
 import { TokenRateRpc } from "./rpc.ts"
-import { buildRecord, formatSummary, type ModelRef, type RateRecord } from "./rate.ts"
+import {
+  averageRates,
+  buildRecord,
+  formatSummary,
+  type ModelRef,
+  type RateRecord,
+} from "./rate.ts"
 
 const EVENT_TYPES = [
   "session.step.started",
@@ -99,10 +105,16 @@ export default Plugin.define({
         const hours = positive(query.hours, 24)
         const bucketMinutes = positive(query.bucketMinutes, 60)
         // shortcut: every summary scans all JSONL files; move to SQLite when history grows large.
+        await writes
         const records = await readRecords(directory)
         return {
           text: formatSummary(records, { hours, bucketMinutes, now: Date.now() }),
         }
+      },
+      averages: async () => {
+        // shortcut: averages scans all JSONL after every step; move to SQLite or in-memory aggregates when history grows.
+        await writes
+        return averageRates(await readRecords(directory))
       },
     })
 

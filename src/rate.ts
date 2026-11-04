@@ -61,6 +61,33 @@ export interface SummaryOptions {
   now?: number
 }
 
+export const RATE_WINDOWS = [
+  { key: "1m", minutes: 1 },
+  { key: "10m", minutes: 10 },
+  { key: "30m", minutes: 30 },
+  { key: "1h", minutes: 60 },
+  { key: "1d", minutes: 1440 },
+] as const
+
+export type RateWindowKey = (typeof RATE_WINDOWS)[number]["key"]
+
+export interface ModelUsage {
+  model: string
+  tokens: number
+  steps: number
+}
+
+export interface SessionAverages {
+  recent30: number
+  session: number
+  windows: Record<RateWindowKey, number>
+  models: ModelUsage[]
+}
+
+export interface RateAverages {
+  sessions: Record<string, SessionAverages>
+}
+
 const BUCKETS = [1, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440]
 const MINUTE = 60_000
 
@@ -121,6 +148,67 @@ export function autoBucketMinutes(hours: number): number {
   return BUCKETS.find((bucket) => bucket >= target) ?? BUCKETS[BUCKETS.length - 1]
 }
 
+export function averageRates(records: readonly RateRecord[]): RateAverages {
+  const bySession = new Map<string, RateRecord[]>()
+  for (const record of records) {
+    const list = bySession.get(record.sessionID) ?? []
+    list.push(record)
+    bySession.set(record.sessionID, list)
+  }
+
+  const sessions: Record<string, SessionAverages> = {}
+  for (const [sessionID, list] of bySession) {
+    list.sort((a, b) => a.at - b.at)
+    const windows = {} as Record<RateWindowKey, number>
+    for (const { key, minutes } of RATE_WINDOWS) {
+      windows[key] = activeWindowRate(list, minutes)
+    }
+    sessions[sessionID] = {
+      recent30: outputRate(list.slice(-30)),
+      session: outputRate(list),
+      windows,
+      models: modelUsages(list),
+    }
+  }
+
+  return { sessions }
+}
+
+function outputRate(records: readonly RateRecord[]): number {
+  let output = 0
+  let generation = 0
+  for (const record of records) {
+    output += record.tokens.output
+    generation += record.duration.generation
+  }
+  return generation > 0 ? (output * 1000) / generation : 0
+}
+
+function activeWindowRate(records: readonly RateRecord[], minutes: number): number {
+  const limit = minutes * MINUTE
+  let output = 0
+  let generation = 0
+  // shortcut: the step that crosses the limit is counted whole, so a window can exceed its limit by one step.
+  for (let i = records.length - 1; i >= 0; i--) {
+    output += records[i].tokens.output
+    generation += records[i].duration.generation
+    if (generation >= limit) break
+  }
+  return generation > 0 ? (output * 1000) / generation : 0
+}
+
+function modelUsages(records: readonly RateRecord[]): ModelUsage[] {
+  const models = new Map<string, ModelUsage>()
+  for (const record of records) {
+    const key = `${record.model.providerID}/${record.model.id}`
+    const usage = models.get(key) ?? { model: record.model.id, tokens: 0, steps: 0 }
+    usage.tokens += totalTokens(record.tokens)
+    usage.steps += 1
+    models.set(key, usage)
+  }
+  return [...models.values()].sort((a, b) => b.tokens - a.tokens || a.model.localeCompare(b.model))
+}
+
 export function formatSummary(records: readonly RateRecord[], options: SummaryOptions): string {
   const now = options.now ?? Date.now()
   const cutoff = now - options.hours * 60 * MINUTE
@@ -157,7 +245,7 @@ function rate(tokens: number, duration: number): string {
   return duration > 0 ? ((tokens * 1000) / duration).toFixed(1) : "0.0"
 }
 
-function formatTokens(value: number): string {
+export function formatTokens(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
   if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`
   return String(Math.round(value))
