@@ -127,6 +127,8 @@ test("averageRates uses session active time for each window and splits models", 
   assert.deepEqual(a.models, [{ model: "test", tokens: 30_055, steps: 10 }])
   assert.equal(averages.sessions.ses_b.session, 50)
   assert.deepEqual(averages.sessions.ses_b.models, [{ model: "other", tokens: 3_100, steps: 1 }])
+  assert.equal(averages.global.all, (155 * 1000) / 102_000)
+  assert.equal(averages.global.recent30, averages.global.all)
 })
 
 test("averageRates caps the recent average at 30 calls", () => {
@@ -140,5 +142,9 @@ test("averageRates caps the recent average at 30 calls", () => {
   assert.equal(a.recent30, 10)
   assert.equal(a.session, 322.1875)
 
-  assert.deepEqual(averageRates([]), { sessions: {} })
+  const averages = averageRates(records)
+  assert.equal(averages.global.recent30, 10)
+  assert.equal(averages.global.all, 322.1875)
+
+  assert.deepEqual(averageRates([]), { sessions: {}, global: { recent30: 0, all: 0 } })
 })

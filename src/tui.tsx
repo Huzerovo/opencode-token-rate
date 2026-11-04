@@ -202,20 +202,29 @@ export default Plugin.define({
       render: ({ sessionID }) => {
         const value = sessionID ? live.bySession[sessionID] : undefined
         const stats = sessionID ? live.averages?.sessions[sessionID] : undefined
+        const global = live.averages?.global
+        const hasGlobal = global !== undefined && (global.recent30 > 0 || global.all > 0)
         const usage = live.usage
-        if (value === undefined && !stats && !usage) return null
+        if (value === undefined && !stats && !hasGlobal && !usage) return null
 
         return (
           <box flexDirection="column" border borderStyle="single" borderColor={context.theme.text.faint} paddingX={1}>
+            <text fg={context.theme.text.muted}>Token rate</text>
             {value !== undefined || stats ? (
               <>
-                <text fg={context.theme.text.muted}>Token rate</text>
                 {section("By calls", "faint")}
                 {rateRow("now", value)}
                 {rateRow("30c", stats?.recent30)}
                 {rateRow("session", stats?.session)}
                 {section("By active time", "faint")}
                 {RATE_WINDOWS.map(({ key }) => rateRow(key, stats?.windows[key]))}
+              </>
+            ) : null}
+            {hasGlobal && global ? (
+              <>
+                {section("Global", "muted")}
+                {rateRow("30c", global.recent30)}
+                {rateRow("all", global.all)}
               </>
             ) : null}
             {stats && stats.models.length > 0 ? (

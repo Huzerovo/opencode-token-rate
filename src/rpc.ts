@@ -67,8 +67,17 @@ export const TokenRateRpc = Rpc.define({
               additionalProperties: false,
             },
           },
+          global: {
+            type: "object",
+            properties: {
+              recent30: { type: "number" },
+              all: { type: "number" },
+            },
+            required: ["recent30", "all"],
+            additionalProperties: false,
+          },
         },
-        required: ["sessions"],
+        required: ["sessions", "global"],
         additionalProperties: false,
       },
     },

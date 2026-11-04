@@ -84,8 +84,14 @@ export interface SessionAverages {
   models: ModelUsage[]
 }
 
+export interface GlobalAverages {
+  recent30: number
+  all: number
+}
+
 export interface RateAverages {
   sessions: Record<string, SessionAverages>
+  global: GlobalAverages
 }
 
 const BUCKETS = [1, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440]
@@ -171,7 +177,14 @@ export function averageRates(records: readonly RateRecord[]): RateAverages {
     }
   }
 
-  return { sessions }
+  const allRecords = [...records].sort((a, b) => a.at - b.at)
+  return {
+    sessions,
+    global: {
+      recent30: outputRate(allRecords.slice(-30)),
+      all: outputRate(allRecords),
+    },
+  }
 }
 
 function outputRate(records: readonly RateRecord[]): number {
